@@ -55,8 +55,10 @@ class DatabaseManager:
         or False if the URL was already present.
         """
         query = """
-            INSERT OR IGNORE INTO pages (url, domain, title, content_text, http_status, content_length)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT OR IGNORE INTO pages (
+                url, domain, title, content_text, http_status, content_length, crawled_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))
         """
         with self._get_connection() as conn:
             cursor = conn.cursor()
@@ -69,6 +71,7 @@ class DatabaseManager:
                     page.content_text,
                     page.http_status,
                     page.content_length,
+                    page.crawled_at,
                 ),
             )
             conn.commit()

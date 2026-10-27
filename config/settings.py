@@ -4,9 +4,18 @@ import os
 from pathlib import Path
 
 # Base Paths
+#
+# Paths are derived from this file's location, not the working directory, so the
+# app behaves the same when started by Streamlit Community Cloud or by hand.
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
-DB_PATH = DATA_DIR / "pages.db"
+
+# The verified corpus lives in data/seeds_check.db (4 crawled pages, all HTTP 200).
+# data/pages.db is a 0-byte leftover from an early crawl attempt and contains no
+# `pages` table, so using it as the default made the indexer fail with
+# "no such table: pages". All code that resolves a default database goes through
+# this value; pass --db explicitly to index a different database.
+DB_PATH = DATA_DIR / "seeds_check.db"
 INDEX_DIR = DATA_DIR / "whoosh_index"
 
 # Crawler Identity & Safety
@@ -23,12 +32,12 @@ ALLOWED_DOMAINS = [
     "eng.libretexts.org",
 ]
 
-# High-quality Mechatronics Seeds
+# High-quality Mechatronics Seeds (all verified to return HTTP 200)
 SEED_URLS = [
-    "https://docs.arduino.cc/learn/electronics/",
+    "https://docs.arduino.cc/learn/",
     "https://docs.arduino.cc/hardware/",
-    "https://eng.libretexts.org/Bookshelves/Control_Systems_Engineering",
     "https://eng.libretexts.org/Bookshelves/Mechanical_Engineering",
+    "https://eng.libretexts.org/Bookshelves/Electrical_Engineering",
 ]
 
 # Ensure data directory exists

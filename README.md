@@ -45,6 +45,9 @@ src/
   search/
     searcher.py           SearchEngine class & search() function with BM25F scoring
     __main__.py           Search CLI entrypoint
+data/
+  seeds_check.db          Verified four-page crawl (committed) - the indexer's source
+  whoosh_index/           Prebuilt Whoosh index (committed) - what the app searches
 tests/                    Offline test suite (mocked HTTP & temporary disk fixtures)
 ```
 
@@ -70,18 +73,18 @@ pip install -r requirements.txt
 Crawl a small, controlled sample of mechatronics pages from an allowlisted seed:
 
 ```powershell
-python -m src.crawler --seed https://docs.arduino.cc/learn/ --max-pages 10 --delay 2 --db data/pages.db
+python -m src.crawler --seed https://docs.arduino.cc/learn/ --max-pages 10 --delay 2 --db data/seeds_check.db
 ```
 
 ### 2. Build or Rebuild the Search Index (Stage 2)
 Build the persistent Whoosh inverted index directly from the SQLite database:
 
 ```powershell
-python -m src.indexer --db data/pages.db --index-dir data/whoosh_index
+python -m src.indexer --db data/seeds_check.db --index-dir data/whoosh_index
 ```
 
 *Options:*
-- `--db PATH`: Path to SQLite database (default: `data/pages.db`).
+- `--db PATH`: Path to SQLite database (default: `data/seeds_check.db`).
 - `--index-dir PATH`: Directory for Whoosh index files (default: `data/whoosh_index`).
 - `--no-clean`: Appends or updates documents instead of wiping and recreating the index directory.
 
@@ -176,20 +179,17 @@ If Streamlit printed `Network URL: http://192.168.1.25:8501`, open exactly that 
 All project paths are centralized in `config/settings.py`:
 
 - `INDEX_DIR` — default `data/whoosh_index`. The Streamlit app and the CLI search both read this index.
-- `DB_PATH` — default `data/pages.db`. It is used by the crawler and indexer, and by the UI only when displaying rebuild instructions. Searching an existing index does not require the database.
+- `DB_PATH` — default `data/seeds_check.db`. It is used by the crawler and indexer, and by the UI only when displaying rebuild instructions. Searching an existing index does not require the database.
 
 Both defaults are built from the project root, so they work even if you launch commands from another working directory.
 
-For the verified four-page collection in this project, the index was built from `data/seeds_check.db`. Build or rebuild it with:
+`data/seeds_check.db` is the verified corpus (four pages, all HTTP 200) and the database the shipped index was built from. `data/pages.db` is a 0-byte leftover from an early crawl attempt: it has no `pages` table, so the indexer would fail with `no such table: pages` if it were treated as the corpus. It is still on disk but is no longer referenced by any default, is excluded from git, and the sidebar now warns when the configured database is present but unusable.
+
+To index a different collection, crawl into your own file and pass it explicitly:
 
 ```powershell
-.venv\Scripts\python.exe -m src.indexer --db data/seeds_check.db --index-dir data/whoosh_index
-```
-
-If you crawled your own pages into `data/pages.db`, use that database instead:
-
-```powershell
-.venv\Scripts\python.exe -m src.indexer --db data/pages.db --index-dir data/whoosh_index
+.venv\Scripts\python.exe -m src.crawler --seed https://docs.arduino.cc/learn/ --max-pages 10 --db data/my_crawl.db
+.venv\Scripts\python.exe -m src.indexer --db data/my_crawl.db --index-dir data/whoosh_index
 ```
 
 ---
@@ -230,18 +230,77 @@ The current collection contains only four pages, so many valid topics are absent
 
 ---
 
-## Deploying to Public Hosting (Not Performed)
+## Deploying to Streamlit Community Cloud
 
-The app is a local demonstrator and has **not** been deployed or exposed publicly. Publishing it would require deliberate decisions and changes beyond this UI work:
+This repository is prepared for Streamlit Community Cloud but **has not been deployed or published**. Nothing below has been carried out: the repository is not on GitHub, its visibility has not been changed, and no app exists yet. The steps are for you to run when you decide to publish.
 
-1. **The host must run a long-lived server process with WebSockets.** Streamlit streams its UI over a WebSocket, so the fit is a container or a platform that supports persistent web services (Streamlit Community Cloud, Render/Railway/Fly.io, or your own VM). Serverless functions that scale to zero and cap request duration do not fit.
-2. **The start command must bind to the platform's interface and port**, for example `--server.address 0.0.0.0 --server.port $env:PORT --server.headless true`. `requirements.txt` already pins everything the app imports.
-3. **The Whoosh index has to exist on the host.** `data/` is gitignored, so a Git-based deploy ships no index and would show the "index is missing" panel. Options: commit a prebuilt index (adjust `.gitignore`), build it during deploy from a committed SQLite database, or mount a volume containing it. Whoosh opens the index directory for reading but writes a `MAIN_WRITELOCK` file there, so the directory must be writable — a read-only image needs a copied working directory or an attached volume.
-4. **Keep crawling off the host.** Rebuilding the index should stay an explicit offline step; the app itself never crawls or indexes.
-5. **TLS and proxying.** Terminate HTTPS at a reverse proxy (Caddy, nginx, or the platform's TLS) or pass `--server.sslCertFile` / `--server.sslKeyFile`. Keep Streamlit's XSRF/CORS defaults unless a reverse proxy gives you a specific reason to change them.
-6. **There is no authentication.** A public URL means anyone can search the collection, and the sidebar displays absolute local paths. Authentication (`st.login`/OIDC, or a proxy's auth) or a private network would be required before exposing it.
-7. **No secrets are needed today.** Paths come from `config/settings.py` and the `data/` directory; there are no API keys, so no secret store is required unless authentication is added.
-8. **Corpus updates are manual.** The index currently holds four documents; a small instance is enough, but the index must be rebuilt and re-uploaded whenever the crawl changes.
+### What was changed so the app can run on a host
+
+| Blocker | Resolution |
+|---|---|
+| All of `data/` was gitignored, so a Git deploy shipped no index | `.gitignore` now ships `data/whoosh_index/` and `data/seeds_check.db` and still ignores scratch files, `.venv`, caches, secrets and Whoosh write locks |
+| The search/indexer modules (`src/search/`, `src/indexer/`, parts of `src/crawler/`) were untracked | Every module `app.py` imports is now tracked |
+| The default database was the empty `data/pages.db` | `DB_PATH` now points at the verified `data/seeds_check.db` |
+| The rebuild command named a Windows-only `.venv\Scripts\python.exe` | It uses the interpreter running the app, so it is correct on Windows and in the container |
+| A 0-byte database passed the "file exists" check | The sidebar classifies the database as ready / missing / unusable instead of trusting mere existence |
+
+Paths are computed from `config/settings.py`'s own location, not the working directory, so `INDEX_DIR` resolves to `<repo>/data/whoosh_index` on the host exactly as it does on your laptop. No absolute paths, environment variables or secrets are required.
+
+Sizes: the index is about 170 KB and the database about 56 KB, far below GitHub's per-file warning threshold and any practical repository limit.
+
+### Step 1 — Put the repository on GitHub (your action)
+
+Community Cloud deploys from a GitHub repository. Create an empty repository on GitHub, then from the project directory:
+
+```powershell
+git remote add origin https://github.com/<your-account>/<repository>.git
+git push -u origin master
+```
+
+For the free Community Cloud tier the repository normally has to be **public**. That is a visibility decision, so it is yours to make; this project contains only four publicly crawled pages and no credentials.
+
+### Step 2 — Create the app
+
+1. Sign in at <https://share.streamlit.io> with the same GitHub account (authorise Streamlit for that repository if asked).
+2. Choose **Create app** / **New app** → *Deploy a public app from GitHub*. Button labels differ slightly between releases.
+3. Fill in:
+   - **Repository:** `<your-account>/<repository>`
+   - **Branch:** `master`
+   - **Main file path:** `app.py`
+4. Open **Advanced settings** and choose a Python version that satisfies the pins in `requirements.txt` (`pandas`, `numpy`, `pyarrow` need a recent interpreter — 3.12 or 3.13 is a safe choice). There are no secrets to add, and no `.streamlit/secrets.toml` is needed.
+5. Press **Deploy**. The first build installs `requirements.txt` and takes a few minutes.
+
+### Step 3 — Check it
+
+The app is served at `https://<app-name>.streamlit.app` and works on a phone with no extra configuration. After the first load, confirm:
+
+- the sidebar reports **Indexed documents: 4**, so the committed index was found and opened;
+- `Arduino hardware` returns 2 results, `sensor` 1, `control` 2, `stepper motor` 1;
+- a blank query shows the "Please enter a search query" warning and `PID controller` shows the no-results message.
+
+If the page shows *"The search index is missing"*, the index was not committed or the working directory differs from the repository root; check `git ls-files data/` before redeploying.
+
+### Updating the corpus later
+
+The host's filesystem is ephemeral, so the index cannot be rebuilt inside the running app. Rebuild locally, commit, and push; Community Cloud redeploys the app automatically on each push:
+
+```powershell
+.venv\Scripts\python.exe -m src.crawler --seed https://docs.arduino.cc/learn/ --max-pages 10 --db data/seeds_check.db
+.venv\Scripts\python.exe -m src.indexer --db data/seeds_check.db --index-dir data/whoosh_index
+git add data/seeds_check.db data/whoosh_index
+git commit -m "Refresh the indexed corpus"
+git push
+```
+
+Crawling never happens on the host: the app only reads the index that was committed.
+
+### Remaining considerations before you make it public
+
+1. **There is no authentication.** Anyone with the link can search, and the sidebar shows the container's absolute index and database paths. That exposes no secret, but if you need access control, add `st.login()` (OIDC) or put the app behind a proxy that authenticates.
+2. **The app sleeps when idle.** Community Cloud suspends inactive apps and wakes them on the next visit, so the first load after a pause is slow. This is normal and needs no code change.
+3. **The corpus is fixed at deploy time.** With four pages, most topics return no results until you crawl and index more pages.
+4. **Whoosh is pure Python and single-node.** That suits a four-document demonstrator; it is not a design for a large, concurrently written corpus. Nothing here writes to the index at runtime, so the platform's read-only usage of the committed files is fine.
+5. **Keep the Streamlit defaults.** XSRF/CORS protection and WebSocket handling are provided by the platform; do not disable them without a specific reason.
 
 ---
 
@@ -284,7 +343,7 @@ All tests are completely offline and use temporary directories, mocked HTTP sess
 .venv\Scripts\python.exe -m pytest -q
 ```
 
-Current test suite status: **88 passing tests** covering:
+Current test suite status: **92 passing tests** covering:
 - Safe URL normalization, redirect checks, and asset extension filtering.
 - robots.txt disallow policies, timeout handling, and crawl delay enforcement.
 - HTML content extraction, visible text cleaning, and canonical URL handling.
@@ -293,6 +352,7 @@ Current test suite status: **88 passing tests** covering:
 - Title vs. body BM25F ranking, positive scores, partial-match policy, absent technical terms, HTML-free snippets, empty/malformed queries, and Windows resource cleanup.
 - Streamlit startup, connection to the existing index, ranking parity with the CLI, zero-result and blank-query states, missing/empty indexes, malformed queries, handled search exceptions, and refreshing a rebuilt index connection.
 - Mobile layout wiring: the domain/relevance-score line for each result (including escaping of untrusted titles and domains), the wrapping example-query buttons still triggering a search, results exposing HTTP(S) tap targets, and the sidebar statistics and controls staying reachable.
+- Deployment readiness: the committed index and database answer the four example queries exactly as expected, the rebuild command names the running interpreter and configured paths, and the sidebar distinguishes a usable database from a missing one and from a file that cannot rebuild the index.
 
 ---
 
@@ -327,7 +387,7 @@ Defines the document structure in Whoosh:
 
 ## Known Limitations
 
-- **Local and Unauthenticated**: the interface has no login and is meant for a trusted local network; do not expose it publicly (see the deployment notes above).
+- **Unauthenticated**: the interface has no login. On a local network that is fine; a public deployment means anyone with the link can search, so add authentication first if the collection should be private (see the deployment section above).
 - **Mobile Styling Tied to Streamlit Internals**: the narrow-screen rules target Streamlit DOM test IDs such as `stButton`, `stLinkButton` and `stTextInput`. A future Streamlit upgrade could rename them, in which case the app still works but loses the touch-target and wrapping polish.
 - **No Live Crawling on Search**: Searching only queries the local disk index; new pages must be crawled and indexed separately.
 - **No Semantic/Vector Search**: Search is lexical and morphological (BM25F + stemming); synonyms not explicitly present in text require user query reformulation.

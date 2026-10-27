@@ -9,7 +9,10 @@ usable in a desktop browser and on a phone screen.
 from __future__ import annotations
 
 import logging
+import os
 import re
+import sqlite3
+import sys
 import time
 import traceback
 from dataclasses import dataclass
@@ -45,6 +48,20 @@ class IndexStatus:
 
     state: str
     document_count: int = 0
+    detail: str = ""
+
+
+DB_READY = "ready"
+DB_MISSING = "missing"
+DB_UNUSABLE = "unusable"
+
+
+@dataclass(frozen=True)
+class DatabaseStatus:
+    """The UI's view of the SQLite file that can rebuild the index."""
+
+    state: str
+    page_count: int = 0
     detail: str = ""
 
 
@@ -133,14 +150,53 @@ def execute_search(engine: SearchEngine, query: str, limit: int) -> SearchSnapsh
     )
 
 
+def inspect_database(path: str | Path) -> DatabaseStatus:
+    """Classifies the SQLite file that the indexer would read.
+
+    A file existing is not proof that an index can be rebuilt: `data/pages.db`
+    was a 0-byte file with no `pages` table, which the indexer rejects. The file
+    is opened read-only because the app never writes to it.
+    """
+    database = Path(path)
+    if not database.is_file():
+        return DatabaseStatus(DB_MISSING)
+    try:
+        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+        try:
+            has_pages = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pages'"
+            ).fetchone()
+            if has_pages is None:
+                return DatabaseStatus(
+                    DB_UNUSABLE, detail="the file has no 'pages' table"
+                )
+            row = connection.execute("SELECT COUNT(*) FROM pages").fetchone()
+            return DatabaseStatus(DB_READY, page_count=int(row[0]) if row else 0)
+        finally:
+            connection.close()
+    except sqlite3.Error as exc:
+        return DatabaseStatus(DB_UNUSABLE, detail=f"{type(exc).__name__}: {exc}")
+
+
+def indexer_shell() -> str:
+    """Names the shell whose quoting the rebuild command is written for."""
+    return "powershell" if os.name == "nt" else "bash"
+
+
 def build_indexer_command(
     db_path: str | Path | None = None, index_dir: str | Path | None = None
 ) -> str:
-    """Builds the documented PowerShell command for rebuilding the index."""
+    """Builds a copy-pasteable command for rebuilding the index.
+
+    The interpreter is the one running this app, so the command stays correct in
+    a local virtual environment and in a hosted deployment instead of naming a
+    Windows-only `.venv\\Scripts` path.
+    """
     database = Path(db_path or settings.DB_PATH)
     index = Path(index_dir or settings.INDEX_DIR)
+    interpreter = sys.executable or "python"
     return (
-        f'.venv\\Scripts\\python.exe -m src.indexer '
+        f'"{interpreter}" -m src.indexer '
         f'--db "{database}" --index-dir "{index}"'
     )
 
@@ -261,18 +317,19 @@ def _render_index_help(status: IndexStatus) -> None:
         st.write("The app expects the Whoosh index at:")
         st.code(str(settings.INDEX_DIR), language=None)
         st.write(
-            "Build it from your crawled SQLite database, for example with "
-            "`data/seeds_check.db` if that is the database you created:"
+            "Build it from the SQLite database that holds the crawled pages "
+            "(the configured path is shown in the sidebar):"
         )
-        st.code(build_indexer_command(), language="powershell")
+        st.code(build_indexer_command(), language=indexer_shell())
         st.info(
-            "Use the database you actually crawled if it differs from the configured "
-            "path. This app never crawls the web or creates an index automatically."
+            "Pass `--db` if the pages live in another database. The shipped index "
+            "was built from `data/seeds_check.db`. This app never crawls the web "
+            "or creates an index automatically."
         )
     elif status.state == INDEX_EMPTY:
         st.warning("The search index exists but contains no documents.")
         st.write("Rebuild it from a populated SQLite database with:")
-        st.code(build_indexer_command(), language="powershell")
+        st.code(build_indexer_command(), language=indexer_shell())
         st.caption(
             "Searching cannot return results until the index contains indexed pages."
         )
@@ -289,7 +346,7 @@ def _render_index_help(status: IndexStatus) -> None:
 
 def _render_sidebar(status: IndexStatus) -> None:
     """Renders project context, corpus statistics, and connection controls."""
-    db_exists = Path(settings.DB_PATH).exists()
+    db_status = inspect_database(settings.DB_PATH)
 
     with st.sidebar:
         st.header("About this project")
@@ -313,10 +370,21 @@ def _render_sidebar(status: IndexStatus) -> None:
         st.code(str(settings.INDEX_DIR), language=None)
         st.caption("SQLite database (used only to rebuild the index)")
         st.code(str(settings.DB_PATH), language=None)
-        if not db_exists:
+        if db_status.state == DB_READY:
+            st.caption(
+                f"{db_status.page_count} stored page record(s) available to "
+                "rebuild the index."
+            )
+        elif db_status.state == DB_MISSING:
             st.info(
                 "The configured database file is not present. Searching the "
                 "existing index still works; rebuilding it requires a valid database."
+            )
+        else:
+            st.info(
+                "The configured database file cannot rebuild the index "
+                f"({db_status.detail or 'it is not a populated crawl database'}). "
+                "Searching the existing index still works."
             )
 
         st.divider()

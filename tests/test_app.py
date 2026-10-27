@@ -1,13 +1,16 @@
 """Tests for the Stage 3 Streamlit interface and its integration with search."""
 
+import sys
 from pathlib import Path
 
 import pytest
 from streamlit.testing.v1 import AppTest
 
 import app
+from config import settings
 from src.indexer.indexer import SearchIndexer
 from src.search.searcher import SearchEngine, search
+from src.storage.db import DatabaseManager
 from src.storage.models import PageRecord, SearchResult
 
 APP_PATH = Path(__file__).resolve().parent.parent / "app.py"
@@ -167,6 +170,77 @@ def test_build_indexer_command_uses_configured_paths(tmp_path):
     assert "-m src.indexer" in command
     assert str(tmp_path / "pages.db") in command
     assert str(tmp_path / "whoosh_index") in command
+
+
+def test_inspect_database_reports_ready_missing_and_unusable(tmp_path):
+    usable = tmp_path / "corpus.db"
+    DatabaseManager(usable).save_page(
+        PageRecord(
+            url="https://docs.arduino.cc/learn/",
+            domain="docs.arduino.cc",
+            title="Learn",
+            content_text="Arduino tutorials.",
+            http_status=200,
+            content_length=18,
+        )
+    )
+    ready = app.inspect_database(usable)
+    assert ready.state == app.DB_READY
+    assert ready.page_count == 1
+
+    missing = app.inspect_database(tmp_path / "absent.db")
+    assert missing.state == app.DB_MISSING
+
+    # The exact shape of the leftover data/pages.db in this project: a file that
+    # exists but cannot rebuild an index.
+    leftover = tmp_path / "pages.db"
+    leftover.write_text("")
+    unusable = app.inspect_database(leftover)
+    assert unusable.state == app.DB_UNUSABLE
+    assert "pages" in unusable.detail
+
+
+@pytest.mark.skipif(
+    not settings.INDEX_DIR.is_dir(),
+    reason="the committed Whoosh index is not present in this checkout",
+)
+def test_repository_ships_a_searchable_index_and_database():
+    """A fresh clone has no crawler run, so the committed index must answer queries."""
+    engine = SearchEngine(index_dir=settings.INDEX_DIR)
+    try:
+        assert engine.document_count() == 4
+        expected_counts = {
+            "Arduino hardware": 2,
+            "sensor": 1,
+            "control": 2,
+            "stepper motor": 1,
+        }
+        for query, count in expected_counts.items():
+            assert len(engine.search(query_text=query, limit=5)) == count, query
+        assert engine.search(query_text="   ", limit=5) == []
+        assert engine.search(query_text="PID controller", limit=5) == []
+    finally:
+        engine.close()
+
+    assert app.inspect_database(settings.DB_PATH).state == app.DB_READY
+
+
+def test_build_indexer_command_uses_the_running_interpreter():
+    command = app.build_indexer_command()
+    assert sys.executable in command
+    assert str(settings.DB_PATH) in command
+    assert str(settings.INDEX_DIR) in command
+    assert "-m src.indexer" in command
+
+
+def test_streamlit_sidebar_explains_an_unusable_database(monkeypatch, ui_index):
+    # _run_app points DB_PATH at a 0-byte file, the situation the app must report.
+    at = _run_app(monkeypatch, ui_index)
+
+    assert not at.exception
+    assert any(
+        "cannot rebuild the index" in info.value for info in at.sidebar.info
+    )
 
 
 def test_execute_search_matches_existing_engine_ranking(ui_index):

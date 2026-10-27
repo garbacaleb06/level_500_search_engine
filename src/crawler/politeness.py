@@ -2,17 +2,37 @@
 
 import time
 import urllib.robotparser
-from urllib.parse import urlparse
 from typing import Dict, Optional
+from urllib.parse import urlparse
+
+import requests
 
 
 class PolitenessManager:
-    """Handles robots.txt adherence and rate-limiting per host."""
+    """Handles robots.txt adherence and rate-limiting per host.
 
-    def __init__(self, user_agent: str, default_delay: float = 2.0, request_timeout: float = 5.0):
+    robots.txt is fetched once per host with the same descriptive User-Agent
+    and timeout used for page requests. Failure policy is deliberately
+    conservative:
+
+    * 2xx            -> parse and obey the rules.
+    * 401/403/5xx    -> treat the whole host as disallowed.
+    * network error  -> treat the whole host as disallowed.
+    * other 4xx      -> robots.txt is unavailable, so crawling is allowed
+                        (standard robot exclusion convention).
+    """
+
+    def __init__(
+        self,
+        user_agent: str,
+        default_delay: float = 2.0,
+        request_timeout: float = 5.0,
+        session: Optional[requests.Session] = None,
+    ):
         self.user_agent = user_agent
         self.default_delay = default_delay
         self.request_timeout = request_timeout
+        self._session = session or requests.Session()
         self._parsers: Dict[str, urllib.robotparser.RobotFileParser] = {}
         self._last_request_times: Dict[str, float] = {}
 
@@ -20,27 +40,45 @@ class PolitenessManager:
         """Extracts the lowercased network location (domain) from a URL."""
         return urlparse(url).netloc.lower()
 
-    def get_robot_parser(self, url: str) -> urllib.robotparser.RobotFileParser:
-        """Retrieves or loads the cached RobotFileParser for a domain."""
+    def _load_robot_parser(self, url: str) -> urllib.robotparser.RobotFileParser:
+        """Fetches and parses robots.txt for the URL's host."""
         domain = self._get_domain(url)
-        if domain in self._parsers:
-            return self._parsers[domain]
-
         scheme = urlparse(url).scheme or "https"
         robots_url = f"{scheme}://{domain}/robots.txt"
 
         parser = urllib.robotparser.RobotFileParser()
         parser.set_url(robots_url)
-        try:
-            # RobotFileParser.read() uses urllib.request internally
-            parser.read()
-        except Exception:
-            # If robots.txt cannot be fetched (e.g. 404 or network timeout),
-            # standard robot exclusion convention allows crawling
-            pass
 
-        self._parsers[domain] = parser
+        try:
+            response = self._session.get(
+                robots_url,
+                headers={"User-Agent": self.user_agent},
+                timeout=self.request_timeout,
+                allow_redirects=True,
+            )
+        except requests.RequestException:
+            # We could not verify the rules, so do not crawl the host.
+            parser.disallow_all = True
+            return parser
+
+        status = response.status_code
+        if 200 <= status < 300:
+            parser.parse(response.text.splitlines())
+        elif 400 <= status < 500 and status not in (401, 403):
+            # robots.txt is unavailable (e.g. 404); standard convention allows.
+            parser.allow_all = True
+        else:
+            # 401/403, 5xx, unexpected status or network failure: fail closed.
+            parser.disallow_all = True
+
         return parser
+
+    def get_robot_parser(self, url: str) -> urllib.robotparser.RobotFileParser:
+        """Retrieves or loads the cached RobotFileParser for a domain."""
+        domain = self._get_domain(url)
+        if domain not in self._parsers:
+            self._parsers[domain] = self._load_robot_parser(url)
+        return self._parsers[domain]
 
     def can_fetch(self, url: str) -> bool:
         """Checks if the user-agent is permitted by robots.txt to crawl the URL."""
@@ -48,7 +86,8 @@ class PolitenessManager:
             parser = self.get_robot_parser(url)
             return parser.can_fetch(self.user_agent, url)
         except Exception:
-            return True
+            # Fail closed: an unexpected parser error must not cause a fetch.
+            return False
 
     def get_crawl_delay(self, url: str) -> float:
         """Returns the domain's crawl delay from robots.txt, or the default delay."""
