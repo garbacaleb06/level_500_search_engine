@@ -3,6 +3,7 @@
 import pytest
 from src.indexer.indexer import SearchIndexer
 from src.indexer.schema import create_search_schema
+from src.indexer.topics import TOPIC_LABELS
 from src.storage.db import DatabaseManager
 from src.storage.models import PageRecord
 
@@ -171,6 +172,67 @@ def test_reopen_existing_index(tmp_path, sample_mechatronics_pages):
         assert reopened_ix.doc_count() == 2
     finally:
         reopened_ix.close()
+
+
+def test_indexer_stores_topic_labels(tmp_path):
+    """Topic labels are computed at index time and stored with the document."""
+    index_dir = tmp_path / "topics_index"
+    indexer = SearchIndexer(index_dir=index_dir)
+    url = "https://docs.arduino.cc/learn/electronics/stepper-motors/"
+
+    report = indexer.build_from_pages(
+        [
+            PageRecord(
+                url=url,
+                domain="docs.arduino.cc",
+                title="Stepper Motor and Driver Basics",
+                content_text=(
+                    "A transistor H-bridge circuit switches motor current; the "
+                    "microcontroller firmware drives it."
+                ),
+                http_status=200,
+                content_length=120,
+            )
+        ],
+        clean=True,
+    )
+    assert report.indexed == 1
+    assert report.unclassified == 0
+
+    ix = indexer.open_or_create_index(clean=False)
+    try:
+        with ix.searcher() as searcher:
+            stored = searcher.document(url=url)["topics"]
+    finally:
+        ix.close()
+
+    assert stored
+    slugs = stored.split(",")
+    assert slugs == sorted(set(slugs), key=slugs.index)  # no duplicates, order kept
+    assert all(slug in TOPIC_LABELS for slug in slugs)
+
+
+def test_indexer_counts_pages_it_cannot_classify(tmp_path):
+    """An unlabelled page is counted rather than silently given a wrong topic."""
+    index_dir = tmp_path / "unclassified_index"
+    indexer = SearchIndexer(index_dir=index_dir)
+
+    report = indexer.build_from_pages(
+        [
+            PageRecord(
+                url="https://example.edu/notes",
+                domain="example.edu",
+                title="Weekly notes",
+                content_text="Reminder to order more coffee for the lab.",
+                http_status=200,
+                content_length=44,
+            )
+        ],
+        clean=True,
+    )
+
+    assert report.indexed == 1
+    assert report.unclassified == 1
 
 
 def test_rebuild_index_reflects_updated_or_deleted_source(tmp_path):

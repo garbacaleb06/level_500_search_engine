@@ -1,7 +1,7 @@
 """Data models for stored pages and search results."""
 
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Optional, Tuple
 
 
 @dataclass
@@ -18,9 +18,15 @@ class PageRecord:
 
 @dataclass
 class SearchResult:
-    """Represents a ranked document result returned to the user or UI."""
+    """Represents a ranked document result returned to the user or UI.
+
+    ``topics`` carries the topic slugs assigned to the page at index time by
+    ``src.indexer.topics.classify_topics``. It defaults to an empty tuple so the
+    field is optional for callers that build a SearchResult by hand.
+    """
     url: str
     title: str
     snippet: str
     score: float
     domain: str
+    topics: Tuple[str, ...] = field(default_factory=tuple)

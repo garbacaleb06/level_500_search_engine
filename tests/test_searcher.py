@@ -6,6 +6,14 @@ from src.search.searcher import SearchEngine, search
 from src.storage.models import PageRecord, SearchResult
 
 
+TOPIC_FIXTURE_URLS = {
+    "control": "https://eng.libretexts.org/pid-controller-design",
+    "electronics": "https://docs.arduino.cc/h-bridge-motor-driver",
+    "robotics": "https://docs.arduino.cc/stepper-actuators",
+    "sensors": "https://docs.arduino.cc/rotary-encoder-sensor",
+}
+
+
 @pytest.fixture
 def arduino_only_index(tmp_path):
     """A four-page Arduino collection with no PID material anywhere in it."""
@@ -318,3 +326,89 @@ def test_search_resource_cleanup_context_manager(mechatronics_index):
     with SearchEngine(index_dir=mechatronics_index) as engine2:
         res2 = engine2.search("pneumatic")
         assert len(res2) == 1
+
+
+def test_results_carry_the_topic_labels_written_by_the_indexer(mechatronics_index):
+    """Topic labels travel from the index into each SearchResult."""
+    results = search("Rotary Encoder", index_dir=mechatronics_index)
+    assert results
+    assert "sensors" in results[0].topics
+
+    control = search("PID Controller", limit=1, index_dir=mechatronics_index)
+    assert control
+    assert "control_systems" in control[0].topics
+
+
+def test_topic_filter_restricts_results(mechatronics_index):
+    """Filtering by topic returns only documents carrying that label."""
+    engine = SearchEngine(index_dir=mechatronics_index)
+    try:
+        unfiltered = engine.search("control", limit=10)
+        filtered = engine.search("control", limit=10, topic="electronics")
+    finally:
+        engine.close()
+
+    assert len(filtered) < len(unfiltered)
+    assert filtered, "the electronics document still matches the query"
+    assert all("electronics" in result.topics for result in filtered)
+    assert TOPIC_FIXTURE_URLS["electronics"] in {r.url for r in filtered}
+
+
+def test_topic_filter_does_not_change_bm25f_scores(mechatronics_index):
+    """A filter excludes documents; it never re-scores the ones it keeps."""
+    engine = SearchEngine(index_dir=mechatronics_index)
+    try:
+        unfiltered = {r.url: r.score for r in engine.search("control", limit=10)}
+        filtered = engine.search("control", limit=10, topic="electronics")
+    finally:
+        engine.close()
+
+    assert filtered
+    for result in filtered:
+        assert result.score == pytest.approx(unfiltered[result.url])
+
+
+def test_topic_filter_returns_nothing_for_an_unknown_topic(mechatronics_index):
+    """An unrecognised filter must not be silently ignored."""
+    assert search("control", index_dir=mechatronics_index, topic="astrophysics") == []
+    assert search("control", index_dir=mechatronics_index, topic="") != []
+    assert search("control", index_dir=mechatronics_index, topic=None) != []
+
+
+def test_topic_filter_narrows_the_robotics_query(mechatronics_index):
+    results = search("actuators", index_dir=mechatronics_index, topic="robotics")
+    assert results
+    assert results[0].url == TOPIC_FIXTURE_URLS["robotics"]
+    assert search("actuators", index_dir=mechatronics_index, topic="sensors") == []
+
+
+def test_topic_and_domain_counts_describe_the_index(mechatronics_index):
+    """The statistics the UI shows are read from the index, not hard-coded."""
+    engine = SearchEngine(index_dir=mechatronics_index)
+    try:
+        topics = engine.topic_counts()
+        domains = engine.domain_counts()
+        assert engine.document_count() == 5
+    finally:
+        engine.close()
+
+    assert domains == {"docs.arduino.cc": 3, "eng.libretexts.org": 2}
+    assert sum(domains.values()) == 5
+    # Every fixture document carries exactly one label, and the counts are read
+    # from the index rather than computed by the test.
+    assert topics == {
+        "control_systems": 1,
+        "electronics": 1,
+        "robotics": 1,
+        "sensors": 1,
+        "embedded_systems": 1,
+    }
+    # Topics without indexed documents are omitted rather than reported as 0.
+    assert "mechanical_engineering" not in topics
+    assert all(count > 0 for count in topics.values())
+
+
+def test_counts_are_empty_when_the_index_is_missing(tmp_path):
+    engine = SearchEngine(index_dir=tmp_path / "absent")
+    assert engine.topic_counts() == {}
+    assert engine.domain_counts() == {}

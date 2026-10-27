@@ -1,0 +1,24 @@
+# Streamlit theme for MechaSearch — navy, white and teal.
+#
+# This file is committed on purpose: Streamlit Community Cloud reads it on
+# deploy, so the visual identity does not depend on any dashboard setting.
+# Only documented theme options are used here, and no secrets belong in it
+# (secrets live in .streamlit/secrets.toml, which is git-ignored).
+
+[theme]
+base = "light"
+primaryColor = "#0E7C86"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F4F7FA"
+textColor = "#0F2A43"
+linkColor = "#0E7C86"
+borderColor = "#D6E2EC"
+font = "sans serif"
+headingFont = "sans serif"
+baseRadius = "0.6rem"
+
+[server]
+# Hosted deployments terminate TLS in front of the app; keeping the defaults
+# means Streamlit's own CORS/XSRF protection stays active.
+enableCORS = true
+enableXsrfProtection = true

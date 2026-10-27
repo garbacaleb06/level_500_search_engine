@@ -9,6 +9,7 @@ from whoosh.index import Index
 
 from config import settings
 from src.indexer.schema import create_search_schema
+from src.indexer.topics import classify_topics
 from src.storage.db import DatabaseManager
 from src.storage.models import PageRecord
 
@@ -20,6 +21,7 @@ class IndexReport:
     skipped: int = 0
     failed: int = 0
     total_pages: int = 0
+    unclassified: int = 0
 
 
 class SearchIndexer:
@@ -84,6 +86,15 @@ class SearchIndexer:
                     content_clean = page.content_text.strip()
                     crawled_at_clean = page.crawled_at or ""
 
+                    # Topic labels come from the page's own title, text and URL via
+                    # the deterministic rules in src.indexer.topics. They are stored
+                    # for filtering and display only and never affect ranking.
+                    topics = classify_topics(
+                        page.title, page.content_text, page.url
+                    )
+                    if not topics:
+                        report.unclassified += 1
+
                     # update_document replaces existing documents with the same unique key (url)
                     writer.update_document(
                         url=page.url,
@@ -91,6 +102,7 @@ class SearchIndexer:
                         title=title_clean,
                         content=content_clean,
                         crawled_at=crawled_at_clean,
+                        topics=",".join(topics),
                     )
                     seen_urls.add(page.url)
                     report.indexed += 1

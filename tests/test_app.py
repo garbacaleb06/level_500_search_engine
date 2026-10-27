@@ -9,6 +9,7 @@ from streamlit.testing.v1 import AppTest
 import app
 from config import settings
 from src.indexer.indexer import SearchIndexer
+from src.indexer.topics import TOPIC_LABELS, topic_label
 from src.search.searcher import SearchEngine, search
 from src.storage.db import DatabaseManager
 from src.storage.models import PageRecord, SearchResult
@@ -92,9 +93,25 @@ def _run_app(monkeypatch, index_dir: Path, db_path: Path | None = None) -> AppTe
 
 
 def test_app_imports_and_has_entry_point():
-    assert app.APP_TITLE == "Mechatronics Search Engine"
+    assert app.APP_TITLE == "MechaSearch"
+    assert app.APP_NAME == "MechaSearch"
+    assert app.APP_HEADING == "Mechatronics Knowledge Hub"
     assert callable(app.main)
     assert app.SearchEngine is SearchEngine
+
+
+def test_app_offers_the_six_documented_topic_filters():
+    """The UI filter order must match the documented topic vocabulary."""
+    assert app.TOPIC_ORDER == (
+        "robotics",
+        "control_systems",
+        "electronics",
+        "mechanical_engineering",
+        "sensors",
+        "embedded_systems",
+    )
+    assert set(app.TOPIC_ORDER) == set(TOPIC_LABELS)
+    assert all(slug in app.TOPIC_COLORS for slug in app.TOPIC_ORDER)
 
 
 def test_normalize_and_prepare_query():
@@ -200,6 +217,32 @@ def test_inspect_database_reports_ready_missing_and_unusable(tmp_path):
     assert "pages" in unusable.detail
 
 
+# The committed index is a build artifact, so these figures change only when the
+# corpus is re-crawled and the index rebuilt. If this test fails after a crawl,
+# re-run the commands in the README's "Rebuilding the corpus" section and update
+# the numbers from the actual output rather than guessing.
+SHIPPED_DOCUMENT_COUNT = 65
+SHIPPED_DOMAIN_COUNTS = {
+    "docs.arduino.cc": 10,
+    "eng.libretexts.org": 12,
+    "ocw.mit.edu": 12,
+    "howtomechatronics.com": 15,
+    "en.wikibooks.org": 16,
+}
+# Every representative query from the Stage E verification list must return at
+# least one result from the shipped corpus.
+REPRESENTATIVE_QUERIES = (
+    "Arduino hardware",
+    "PID controller",
+    "DC motor control",
+    "stepper motor",
+    "robotic arm",
+    "sensors and actuators",
+    "control systems",
+    "mechanical design",
+)
+
+
 @pytest.mark.skipif(
     not settings.INDEX_DIR.is_dir(),
     reason="the committed Whoosh index is not present in this checkout",
@@ -208,21 +251,47 @@ def test_repository_ships_a_searchable_index_and_database():
     """A fresh clone has no crawler run, so the committed index must answer queries."""
     engine = SearchEngine(index_dir=settings.INDEX_DIR)
     try:
-        assert engine.document_count() == 4
-        expected_counts = {
-            "Arduino hardware": 2,
-            "sensor": 1,
-            "control": 2,
-            "stepper motor": 1,
-        }
-        for query, count in expected_counts.items():
-            assert len(engine.search(query_text=query, limit=5)) == count, query
+        assert engine.document_count() == SHIPPED_DOCUMENT_COUNT
+        assert engine.domain_counts() == SHIPPED_DOMAIN_COUNTS
+        assert sum(SHIPPED_DOMAIN_COUNTS.values()) == SHIPPED_DOCUMENT_COUNT
+
+        # All six UI topic filters must be backed by real indexed documents.
+        topic_counts = engine.topic_counts()
+        assert set(topic_counts) == set(app.TOPIC_ORDER)
+        assert all(count > 0 for count in topic_counts.values())
+
+        for query in REPRESENTATIVE_QUERIES:
+            results = engine.search(query_text=query, limit=5)
+            assert results, query
+            assert all(result.score > 0.0 for result in results), query
+
         assert engine.search(query_text="   ", limit=5) == []
-        assert engine.search(query_text="PID controller", limit=5) == []
+        assert engine.search(query_text="zzzznonsense", limit=5) == []
     finally:
         engine.close()
 
     assert app.inspect_database(settings.DB_PATH).state == app.DB_READY
+
+
+@pytest.mark.skipif(
+    not settings.INDEX_DIR.is_dir(),
+    reason="the committed Whoosh index is not present in this checkout",
+)
+def test_shipped_index_answers_a_topic_filtered_query():
+    """The deployed corpus supports real topic filtering, not decorative pills."""
+    engine = SearchEngine(index_dir=settings.INDEX_DIR)
+    try:
+        unfiltered = engine.search("stepper motor", limit=10)
+        filtered = engine.search("stepper motor", limit=10, topic="robotics")
+        assert filtered
+        assert all("robotics" in result.topics for result in filtered)
+
+        # A filter the corpus cannot satisfy returns nothing rather than
+        # silently falling back to the unfiltered set.
+        assert engine.search("stepper motor", limit=10, topic="not_a_topic") == []
+        assert len(filtered) <= len(unfiltered)
+    finally:
+        engine.close()
 
 
 def test_build_indexer_command_uses_the_running_interpreter():
@@ -273,12 +342,44 @@ def test_streamlit_app_starts_and_connects_to_existing_index(monkeypatch, ui_ind
     at = _run_app(monkeypatch, ui_index)
 
     assert not at.exception
-    assert any(title.value == app.APP_TITLE for title in at.title)
+    assert any(title.value == app.APP_HEADING for title in at.title)
     assert any(
         metric.label == "Indexed documents" and metric.value == "4"
         for metric in at.metric
     )
     assert at.text_input(key="query_input").value == ""
+
+
+def test_topic_options_only_offer_topics_the_index_can_answer():
+    options = app.topic_options({"embedded_systems": 2, "mechanical_engineering": 1})
+
+    assert options[0] == (app.ALL_TOPICS_LABEL, None)
+    assert ("Embedded Systems (2)", "embedded_systems") in options
+    assert ("Mechanical Engineering (1)", "mechanical_engineering") in options
+    # No indexed document carries this label, so no pill is offered for it.
+    assert all(slug != "sensors" for _label, slug in options)
+    assert all(slug != "robotics" for _label, slug in options)
+
+
+def test_topic_options_follow_the_documented_order():
+    counts = {slug: 1 for slug in app.TOPIC_ORDER}
+    labels = [label for label, _slug in app.topic_options(counts)]
+
+    assert labels == [app.ALL_TOPICS_LABEL] + [
+        f"{topic_label(slug)} (1)" for slug in app.TOPIC_ORDER
+    ]
+
+
+def test_collection_summary_is_compact_and_counts_real_entries():
+    summary = app.collection_summary(
+        63,
+        {"docs.arduino.cc": 10, "eng.libretexts.org": 12},
+        {"robotics": 9, "sensors": 11},
+    )
+
+    assert "63 indexed document(s)" in summary
+    assert "2 source site(s)" in summary
+    assert "2 topic(s)" in summary
 
 
 def test_streamlit_search_matches_existing_ranking(monkeypatch, ui_index):
@@ -462,3 +563,104 @@ def test_streamlit_sidebar_keeps_statistics_and_controls(monkeypatch, ui_index):
     assert any(metric.label == "Indexed documents" for metric in sidebar.metric)
     assert sidebar.button(key="clear_search_button") is not None
     assert sidebar.button(key="refresh_index_button") is not None
+    # Compact per-source and per-topic statistics come from the index itself.
+    sidebar_text = "\n".join(markdown.value for markdown in sidebar.markdown)
+    assert "docs.arduino.cc" in sidebar_text
+    assert "eng.libretexts.org" in sidebar_text
+    assert "Embedded Systems" in sidebar_text
+
+
+def test_streamlit_topic_filter_offers_only_indexed_topics_with_counts(
+    monkeypatch, ui_index
+):
+    at = _run_app(monkeypatch, ui_index)
+
+    assert not at.exception
+    pills = at.pills(key="topic_filter")
+    assert pills.value == app.ALL_TOPICS_LABEL
+    # The four fixture pages classify as Embedded Systems (2), Electronics (1)
+    # and Mechanical Engineering (1); the count is shown in the pill label.
+    assert "Embedded Systems (2)" in pills.options
+    assert "Electronics (1)" in pills.options
+    assert "Mechanical Engineering (1)" in pills.options
+    assert "Robotics (1)" not in pills.options
+
+
+def test_streamlit_topic_filter_restricts_the_search(monkeypatch, ui_index):
+    at = _run_app(monkeypatch, ui_index)
+    at.text_input(key="query_input").set_value("Arduino hardware").run()
+    assert {m.label: m.value for m in at.metric}["Matching results"] == "2"
+
+    at.pills(key="topic_filter").set_value("Mechanical Engineering (1)").run()
+
+    assert not at.exception
+    # The filter genuinely filters: the same query now matches nothing, because
+    # no Mechanical Engineering document discusses Arduino hardware.
+    assert {m.label: m.value for m in at.metric}["Matching results"] == "0"
+    assert any("No documents matched" in warning.value for warning in at.warning)
+    assert any("Mechanical Engineering" in warning.value for warning in at.warning)
+
+
+def test_streamlit_topic_filter_keeps_documents_that_carry_the_label(
+    monkeypatch, ui_index
+):
+    at = _run_app(monkeypatch, ui_index)
+    at.text_input(key="query_input").set_value("Arduino hardware").run()
+
+    at.pills(key="topic_filter").set_value("Embedded Systems (2)").run()
+
+    assert not at.exception
+    assert {m.label: m.value for m in at.metric}["Matching results"] == "2"
+    expected = search("Arduino hardware", index_dir=ui_index, topic="embedded_systems")
+    headings = [
+        markdown.value
+        for markdown in at.markdown
+        if markdown.value.startswith("#### ")
+    ]
+    assert headings == [
+        f"#### {rank}. {result.title}"
+        for rank, result in enumerate(expected, start=1)
+    ]
+
+
+def test_streamlit_result_cards_show_topic_badges(monkeypatch, ui_index):
+    at = _run_app(monkeypatch, ui_index)
+    at.text_input(key="query_input").set_value("Arduino hardware").run()
+
+    assert not at.exception
+    # st.badge renders the color-badge Markdown directive; the label is the same
+    # vocabulary the indexer wrote, so the card and the filter agree.
+    rendered = "\n".join(markdown.value for markdown in at.markdown)
+    assert f"badge[{topic_label('embedded_systems')}]" in rendered
+
+
+def test_streamlit_header_reports_the_collection_size(monkeypatch, ui_index):
+    at = _run_app(monkeypatch, ui_index)
+
+    assert not at.exception
+    captions = "\n".join(caption.value for caption in at.caption)
+    assert "4 indexed document(s)" in captions
+    assert "2 source site(s)" in captions
+
+
+def test_execute_search_applies_a_topic_filter(ui_index):
+    engine = app.create_search_engine(ui_index)
+    try:
+        unfiltered = app.execute_search(engine, "Arduino hardware", 5)
+        filtered = app.execute_search(engine, "Arduino hardware", 5, "sensors")
+    finally:
+        engine.close()
+
+    assert filtered.topic == "sensors"
+    assert len(unfiltered.results) == 2
+    assert filtered.results == ()
+
+
+def test_execute_search_records_the_active_filter(ui_index):
+    engine = app.create_search_engine(ui_index)
+    try:
+        snapshot = app.execute_search(engine, "Arduino hardware", 5, "sensors")
+    finally:
+        engine.close()
+    assert snapshot.topic == "sensors"
+    assert app._active_topic_label(snapshot.topic) == "Sensors"

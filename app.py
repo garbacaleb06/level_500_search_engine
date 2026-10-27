@@ -1,9 +1,14 @@
-"""Stage 3 Streamlit interface for the Mechatronics Search Engine.
+"""MechaSearch — Streamlit interface for the Mechatronics Knowledge Hub.
 
-The page is a thin presentation layer over the existing local Whoosh search
-engine. It never crawls the web, calls an external search API, or rebuilds the
-index while serving a query. The layout is responsive so the same page is
-usable in a desktop browser and on a phone screen.
+The page is a presentation layer over the existing local Whoosh search engine.
+It never crawls the web, calls an external search API, or rebuilds the index
+while serving a query. The layout is responsive so the same page is usable in a
+desktop browser and on a phone screen.
+
+Visual design is driven by Streamlit's own theme (`.streamlit/config.toml`) plus a
+small stylesheet for touch targets and narrow-screen wrapping. Components are
+native Streamlit widgets: `st.pills` for the topic filter, bordered containers for
+result cards, and `st.badge` for topic labels.
 """
 
 from __future__ import annotations
@@ -17,22 +22,52 @@ import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
 import streamlit as st
 
 from config import settings
+from src.indexer.topics import TOPIC_LABELS, topic_label
 from src.search.searcher import SearchEngine
 from src.storage.models import SearchResult
 
 logger = logging.getLogger(__name__)
 
-APP_TITLE = "Mechatronics Search Engine"
+# Application identity
+APP_NAME = "MechaSearch"
+APP_TITLE = "MechaSearch"
+APP_HEADING = "Mechatronics Knowledge Hub"
+APP_TAGLINE = (
+    "A focused search engine for mechatronics, robotics, control systems, "
+    "electronics and mechanical engineering."
+)
+
 DEFAULT_LIMIT = 5
 MAX_LIMIT = 20
 LIMIT_OPTIONS = (5, 10, 20)
-EXAMPLE_QUERIES = ("Arduino hardware", "sensor", "control", "stepper motor")
+EXAMPLE_QUERIES = ("Arduino hardware", "PID controller", "stepper motor", "sensor")
+
+# Topic filter. The order here is the order the pills are shown in, and the
+# labels come from the shared rule table so the UI cannot drift from the labels
+# the indexer actually wrote into the index.
+TOPIC_ORDER: Tuple[str, ...] = (
+    "robotics",
+    "control_systems",
+    "electronics",
+    "mechanical_engineering",
+    "sensors",
+    "embedded_systems",
+)
+TOPIC_COLORS: Dict[str, str] = {
+    "robotics": "violet",
+    "control_systems": "blue",
+    "electronics": "orange",
+    "mechanical_engineering": "gray",
+    "sensors": "green",
+    "embedded_systems": "yellow",
+}
+ALL_TOPICS_LABEL = "All topics"
 
 INDEX_READY = "ready"
 INDEX_MISSING = "missing"
@@ -73,6 +108,7 @@ class SearchSnapshot:
     results: Tuple[SearchResult, ...]
     elapsed_ms: float
     limit: int
+    topic: Optional[str] = None
 
 
 def normalize_query(value: object) -> str:
@@ -136,17 +172,23 @@ def inspect_index(engine: SearchEngine) -> IndexStatus:
         return IndexStatus(INDEX_ERROR, detail=f"{type(exc).__name__}: {exc}")
 
 
-def execute_search(engine: SearchEngine, query: str, limit: int) -> SearchSnapshot:
+def execute_search(
+    engine: SearchEngine,
+    query: str,
+    limit: int,
+    topic: Optional[str] = None,
+) -> SearchSnapshot:
     """Runs exactly one local BM25F search and records its wall-clock time."""
     effective_limit = clamp_limit(limit)
     started = time.perf_counter()
-    results = engine.search(query_text=query, limit=effective_limit)
+    results = engine.search(query_text=query, limit=effective_limit, topic=topic)
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     return SearchSnapshot(
         query=query,
         results=tuple(results),
         elapsed_ms=elapsed_ms,
         limit=effective_limit,
+        topic=topic,
     )
 
 
@@ -201,6 +243,34 @@ def build_indexer_command(
     )
 
 
+def topic_options(topic_counts: Dict[str, int]) -> List[Tuple[str, Optional[str]]]:
+    """Returns the topic filter choices the index can actually answer.
+
+    Only topics with at least one indexed document are offered. A pill that
+    filtered to nothing would be decorative, and the brief for this stage was
+    explicit that filters must operate on real indexed metadata.
+    """
+    options: List[Tuple[str, Optional[str]]] = [(ALL_TOPICS_LABEL, None)]
+    for slug in TOPIC_ORDER:
+        if topic_counts.get(slug, 0) > 0:
+            options.append((f"{topic_label(slug)} ({topic_counts[slug]})", slug))
+    return options
+
+
+def collection_summary(
+    document_count: int,
+    domain_counts: Dict[str, int],
+    topic_counts: Dict[str, int],
+) -> str:
+    """Builds the compact one-line statistics caption."""
+    sources = len(domain_counts)
+    topics = len(topic_counts)
+    return (
+        f"{document_count} indexed document(s) · {sources} source site(s) · "
+        f"{topics} topic(s) with matches"
+    )
+
+
 @st.cache_resource(show_spinner=False)
 def get_search_engine(index_dir: str) -> SearchEngine:
     """Caches the engine, which in turn caches the opened Whoosh index."""
@@ -241,19 +311,15 @@ def _refresh_index() -> None:
         st.session_state.pop("last_search_error", None)
 
 
+# Streamlit's theme (navy / white / teal) is set in .streamlit/config.toml. This
+# stylesheet only adds what a theme cannot express: touch-target sizes, wrapping
+# of long URLs and paths, and a tighter phone layout.
 MOBILE_CSS = """
 <style>
-/* Reading column: keeps content inside the viewport at every screen size. */
 .block-container {
     max-width: 1080px;
     padding-top: 2.2rem;
     padding-bottom: 3rem;
-}
-div[data-testid="stMetric"] {
-    background: #f8fafc;
-    border: 1px solid #e5e7eb;
-    border-radius: 0.6rem;
-    padding: 0.7rem 0.9rem;
 }
 /* Long target URLs, index paths and shell commands must wrap instead of
    forcing horizontal scrolling on a narrow phone screen. */
@@ -344,48 +410,50 @@ def _render_index_help(status: IndexStatus) -> None:
                 st.code(status.detail, language="text")
 
 
+def _render_collection_statistics(
+    status: IndexStatus, domain_counts: Dict[str, int], topic_counts: Dict[str, int]
+) -> None:
+    """Renders compact source and topic statistics inside the sidebar."""
+    st.subheader("Collection")
+    if status.state == INDEX_READY:
+        st.metric("Indexed documents", status.document_count)
+    elif status.state == INDEX_EMPTY:
+        st.metric("Indexed documents", 0)
+        st.caption("The index exists but is empty.")
+    else:
+        st.metric("Indexed documents", "Unavailable")
+
+    if domain_counts:
+        st.caption("Sources")
+        for domain, count in sorted(
+            domain_counts.items(), key=lambda item: (-item[1], item[0])
+        ):
+            st.markdown(f"- {escape_markdown(domain)} — {count}")
+
+    if topic_counts:
+        st.caption("Topics")
+        for slug in TOPIC_ORDER:
+            count = topic_counts.get(slug, 0)
+            if count:
+                st.markdown(f"- {escape_markdown(topic_label(slug))} — {count}")
+
+
 def _render_sidebar(status: IndexStatus) -> None:
     """Renders project context, corpus statistics, and connection controls."""
     db_status = inspect_database(settings.DB_PATH)
+    domain_counts = st.session_state.get("domain_counts", {})
+    topic_counts = st.session_state.get("topic_counts", {})
 
     with st.sidebar:
-        st.header("About this project")
-        st.write(
-            "A university mechatronics project that crawls a small, allowlisted "
-            "set of engineering pages, stores them in SQLite, indexes them with "
-            "Whoosh, and ranks local results with BM25F."
+        st.subheader(f"About {APP_NAME}")
+        st.caption(APP_TAGLINE)
+        st.caption(
+            "Crawls a small allowlisted set of engineering pages, stores them in "
+            "SQLite, indexes them with Whoosh and ranks local results with BM25F."
         )
 
         st.divider()
-        st.subheader("Current collection")
-        if status.state == INDEX_READY:
-            st.metric("Indexed documents", status.document_count)
-        elif status.state == INDEX_EMPTY:
-            st.metric("Indexed documents", 0)
-            st.caption("The index exists but is empty.")
-        else:
-            st.metric("Indexed documents", "Unavailable")
-
-        st.caption("Whoosh index directory")
-        st.code(str(settings.INDEX_DIR), language=None)
-        st.caption("SQLite database (used only to rebuild the index)")
-        st.code(str(settings.DB_PATH), language=None)
-        if db_status.state == DB_READY:
-            st.caption(
-                f"{db_status.page_count} stored page record(s) available to "
-                "rebuild the index."
-            )
-        elif db_status.state == DB_MISSING:
-            st.info(
-                "The configured database file is not present. Searching the "
-                "existing index still works; rebuilding it requires a valid database."
-            )
-        else:
-            st.info(
-                "The configured database file cannot rebuild the index "
-                f"({db_status.detail or 'it is not a populated crawl database'}). "
-                "Searching the existing index still works."
-            )
+        _render_collection_statistics(status, domain_counts, topic_counts)
 
         st.divider()
         st.button(
@@ -402,7 +470,35 @@ def _render_sidebar(status: IndexStatus) -> None:
             width="stretch",
         )
 
-        st.divider()
+        with st.expander("Setup details"):
+            st.caption("Whoosh index directory")
+            st.code(str(settings.INDEX_DIR), language=None)
+            st.caption("SQLite database (used only to rebuild the index)")
+            st.code(str(settings.DB_PATH), language=None)
+            if db_status.state == DB_READY:
+                st.caption(
+                    f"{db_status.page_count} stored page record(s) available to "
+                    "rebuild the index."
+                )
+            elif db_status.state == DB_MISSING:
+                st.info(
+                    "The configured database file is not present. Searching the "
+                    "existing index still works; rebuilding it needs a valid database."
+                )
+            else:
+                st.info(
+                    "The configured database file cannot rebuild the index "
+                    f"({db_status.detail or 'it is not a populated crawl database'}). "
+                    "Searching the existing index still works."
+                )
+
+        with st.expander("Sources and licensing"):
+            st.caption(
+                "Every source is crawled only after its robots.txt permits this "
+                "User-Agent and with the per-domain delay it declares. Page content "
+                "belongs to the original authors and is linked, not reproduced."
+            )
+
         st.caption(
             "Local search only: no external search API, web crawl, or index "
             "rebuild happens when you submit a query."
@@ -413,6 +509,20 @@ def format_result_meta(result: SearchResult) -> str:
     """Builds the one-line domain and relevance score shown under a title."""
     domain = escape_markdown(result.domain or "unknown domain")
     return f"{domain} · Relevance score (BM25F): {result.score:.3f}"
+
+
+def _render_result_topics(result: SearchResult) -> None:
+    """Shows the topic labels the indexer assigned to this document."""
+    if not result.topics:
+        return
+    # A wrapping row of badges stays on one line on a phone and never scrolls
+    # sideways. Labels are a fixed vocabulary, not crawled text.
+    with st.container(horizontal=True, wrap=True, gap="small"):
+        for slug in result.topics:
+            st.badge(
+                topic_label(slug),
+                color=TOPIC_COLORS.get(slug, "blue"),
+            )
 
 
 def _render_result(result: SearchResult, rank: int) -> None:
@@ -427,6 +537,7 @@ def _render_result(result: SearchResult, rank: int) -> None:
     with st.container(border=True):
         st.markdown(f"#### {rank}. {title}")
         st.caption(format_result_meta(result))
+        _render_result_topics(result)
         st.markdown(snippet)
 
         url = safe_http_url(result.url)
@@ -438,6 +549,11 @@ def _render_result(result: SearchResult, rank: int) -> None:
             st.warning("This result has an invalid URL and cannot be opened.")
 
 
+def _active_topic_label(topic: Optional[str]) -> str:
+    """Returns the display name of the active topic filter."""
+    return topic_label(topic) if topic else ALL_TOPICS_LABEL
+
+
 def _render_search_state(status: IndexStatus) -> None:
     """Shows the current search result, empty state, or search error."""
     if status.state != INDEX_READY:
@@ -447,7 +563,7 @@ def _render_search_state(status: IndexStatus) -> None:
     if st.session_state.get("empty_submitted"):
         st.warning(
             "Please enter a search query before searching. "
-            "Try a topic such as `Arduino hardware`, `sensor`, or `control`."
+            "Try a topic such as `Arduino hardware`, `PID controller`, or `sensor`."
         )
         return
 
@@ -464,8 +580,13 @@ def _render_search_state(status: IndexStatus) -> None:
     snapshot: Optional[SearchSnapshot] = st.session_state.get("last_snapshot")
     if snapshot is None:
         st.info(
-            "Enter a query above to search the local mechatronics collection. "
-            "Example queries are suggestions only; results depend on what is indexed."
+            "Start typing above, or tap one of the suggested queries. Results come "
+            "only from the pages indexed in this project, so a topic the collection "
+            "does not cover will return nothing."
+        )
+        st.caption(
+            "Every result is ranked by the project's own Whoosh BM25F engine, and "
+            "each one links back to the original page."
         )
         return
 
@@ -474,29 +595,59 @@ def _render_search_state(status: IndexStatus) -> None:
     metric_columns[1].metric("Search time", f"{snapshot.elapsed_ms:.1f} ms")
     metric_columns[2].metric("Indexed documents", status.document_count)
 
+    topic_note = (
+        f" Filtered to **{_active_topic_label(snapshot.topic)}**."
+        if snapshot.topic
+        else ""
+    )
+
     if not snapshot.results:
         st.warning(
-            f'No documents matched "{escape_markdown(snapshot.query)}". '
-            "The local index may not contain this topic."
+            f'No documents matched "{escape_markdown(snapshot.query)}".'
+            f"{topic_note}"
         )
         st.write(
             "This does not mean the topic is absent from the internet; it only "
-            "means the currently indexed collection has no matching pages. Try "
-            "broader or alternative terms, such as `motor`, `sensor`, `control`, "
-            "or `Arduino hardware`."
+            "means the currently indexed collection has no matching pages. Things "
+            "worth trying:"
+        )
+        st.markdown(
+            "- Use broader or alternative terms, such as `motor`, `sensor`, `control` "
+            "or `robotics`.\n"
+            "- Clear the topic filter to search the whole collection.\n"
+            "- Check the sidebar for the topics and sources the index actually covers."
         )
         st.caption(
-            f"Showing up to {snapshot.limit} results. The ranking, partial-match "
-            "policy, and snippets come from the existing BM25F search engine."
+            f"Searched {status.document_count} indexed document(s) with up to "
+            f"{snapshot.limit} results requested."
         )
         return
 
     st.caption(
-        f'Showing up to {snapshot.limit} results for "{escape_markdown(snapshot.query)}". '
+        f'Showing up to {snapshot.limit} results for '
+        f'"{escape_markdown(snapshot.query)}".{topic_note} '
         "Order and scores come directly from the existing BM25F engine."
     )
     for rank, result in enumerate(snapshot.results, start=1):
         _render_result(result, rank)
+
+
+def _render_header(status: IndexStatus) -> None:
+    """Renders the application identity and the compact statistics line."""
+    st.title(APP_HEADING)
+    st.write(f"**{APP_NAME}** · {APP_TAGLINE}")
+    if status.state == INDEX_READY:
+        st.caption(
+            collection_summary(
+                status.document_count,
+                st.session_state.get("domain_counts", {}),
+                st.session_state.get("topic_counts", {}),
+            )
+        )
+    st.caption(
+        "Local demonstrator · no external search API · no crawling or index "
+        "rebuilding during searches"
+    )
 
 
 def main() -> None:
@@ -521,33 +672,37 @@ def main() -> None:
         logger.exception("Unable to initialize the search engine")
         status = IndexStatus(INDEX_ERROR, detail=initialization_error)
 
-    st.title(APP_TITLE)
-    st.write(
-        "Search a **locally indexed collection** of mechatronics, electronics, "
-        "mechanical engineering, robotics, automation, and embedded-systems "
-        "resources. Results are ranked by the project's existing Whoosh BM25F "
-        "search engine."
-    )
-    st.caption(
-        "Local demonstrator only · no external search API · no crawling or "
-        "index rebuilding during searches"
-    )
-    st.caption(
-        "On a phone, open the sidebar with the `»` arrow (top left) for setup "
-        "details and collection statistics."
-    )
+    # Statistics are read once per run and reused for the sidebar and header.
+    if status.state == INDEX_READY:
+        try:
+            st.session_state["topic_counts"] = engine.topic_counts()
+            st.session_state["domain_counts"] = engine.domain_counts()
+        except Exception:
+            logger.exception("Unable to read collection statistics")
+            st.session_state["topic_counts"] = {}
+            st.session_state["domain_counts"] = {}
+    else:
+        st.session_state["topic_counts"] = {}
+        st.session_state["domain_counts"] = {}
+
+    _render_header(status)
+
+    topic_choices = topic_options(st.session_state.get("topic_counts", {}))
 
     st.text_input(
         "Search the indexed collection",
-        placeholder="e.g. Arduino hardware, sensor, stepper motor",
+        placeholder="Search topics, components, techniques — e.g. Arduino hardware, PID controller",
         key="query_input",
         on_change=_queue_search,
-        help="Press Enter or use the Search button. Leading and trailing whitespace is trimmed.",
+        help=(
+            "Press Enter or use the Search button. Leading and trailing "
+            "whitespace is trimmed."
+        ),
     )
 
     # On a phone these two columns stack into full-width taps; on a desktop
     # they stay side by side, so both layouts remain usable.
-    search_column, limit_column = st.columns([1, 1])
+    search_column, limit_column = st.columns([2, 1])
     with search_column:
         st.button(
             "Search",
@@ -563,12 +718,30 @@ def main() -> None:
             index=0,
             key="result_limit",
             help=(
-                f"Choose between 1 and {MAX_LIMIT} results. The selected limit "
-                "applies to your next search. The default is 5."
+                f"Choose between 1 and {MAX_LIMIT} results. Changing this re-runs "
+                "the current search. The default is 5."
             ),
         )
 
-    st.caption("Example queries (tap one to search; suggestions only, corpus is small):")
+    # The topic filter is a real filter: each option carries the number of indexed
+    # documents behind it, and selecting one restricts the Whoosh search to pages
+    # the indexer labelled with that topic.
+    selected_label = st.pills(
+        "Topic filter",
+        options=[label for label, _slug in topic_choices],
+        selection_mode="single",
+        default=ALL_TOPICS_LABEL,
+        key="topic_filter",
+        help=(
+            "Restricts results to documents labelled with that topic at index "
+            "time. Topics are assigned from each page's own title, text and URL."
+        ),
+    )
+    selected_topic = dict(
+        (label, slug) for label, slug in topic_choices
+    ).get(selected_label)
+
+    st.caption("Suggested queries (tap one to search):")
     # A wrapping chip row stays compact on a phone instead of stacking four
     # full-width buttons above the results.
     with st.container(horizontal=True, wrap=True):
@@ -596,14 +769,35 @@ def main() -> None:
         elif status.state != INDEX_READY:
             st.session_state.pop("last_snapshot", None)
         else:
-            try:
-                st.session_state["last_snapshot"] = execute_search(
-                    engine, query, result_limit
-                )
-            except Exception:
-                logger.exception("Search failed for query %r", query)
-                st.session_state["last_search_error"] = traceback.format_exc()
-                st.session_state.pop("last_snapshot", None)
+            with st.spinner("Searching the local index…"):
+                try:
+                    st.session_state["last_snapshot"] = execute_search(
+                        engine, query, result_limit, selected_topic
+                    )
+                except Exception:
+                    logger.exception("Search failed for query %r", query)
+                    st.session_state["last_search_error"] = traceback.format_exc()
+                    st.session_state.pop("last_snapshot", None)
+
+    # Changing the topic filter or the result limit re-runs the retained query so
+    # the visible results always correspond to the controls that are set.
+    snapshot: Optional[SearchSnapshot] = st.session_state.get("last_snapshot")
+    if (
+        snapshot is not None
+        and initialization_error is None
+        and status.state == INDEX_READY
+    ):
+        tightened_limit = clamp_limit(result_limit)
+        if snapshot.topic != selected_topic or snapshot.limit != tightened_limit:
+            with st.spinner("Applying filters…"):
+                try:
+                    st.session_state["last_snapshot"] = execute_search(
+                        engine, snapshot.query, tightened_limit, selected_topic
+                    )
+                except Exception:
+                    logger.exception("Search failed for query %r", snapshot.query)
+                    st.session_state["last_search_error"] = traceback.format_exc()
+                    st.session_state.pop("last_snapshot", None)
 
     _render_sidebar(status)
 

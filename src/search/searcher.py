@@ -4,12 +4,14 @@ import gc
 import html
 import re
 from pathlib import Path
-from typing import List, Optional, Set, Union
+from typing import Dict, List, Optional, Set, Tuple, Union
 from whoosh import index, scoring
 from whoosh.index import Index
 from whoosh.qparser import MultifieldParser, OrGroup, QueryParserError
+from whoosh.query import NullQuery, Term
 
 from config import settings
+from src.indexer.topics import TOPIC_LABELS
 from src.storage.models import SearchResult
 
 
@@ -52,6 +54,53 @@ class SearchEngine:
         if ix is None:
             return 0
         return ix.doc_count()
+
+    def topic_counts(self) -> Dict[str, int]:
+        """Returns {topic slug: document count} for topics actually present.
+
+        Topics with no indexed documents are omitted, so the UI can never offer a
+        filter pill that would return nothing. Read-only: it inspects the index
+        lexicon and does not alter the index, query parsing or ranking.
+        """
+        ix = self._get_index()
+        if ix is None:
+            return {}
+        counts: Dict[str, int] = {}
+        with ix.searcher() as searcher:
+            for slug in TOPIC_LABELS:
+                frequency = searcher.doc_frequency("topics", slug)
+                if frequency > 0:
+                    counts[slug] = frequency
+        return counts
+
+    def domain_counts(self) -> Dict[str, int]:
+        """Returns {domain: document count} for the indexed collection."""
+        ix = self._get_index()
+        if ix is None:
+            return {}
+        counts: Dict[str, int] = {}
+        with ix.searcher() as searcher:
+            for term in searcher.lexicon("domain"):
+                name = term.decode("utf-8", "replace") if isinstance(term, bytes) else term
+                counts[name] = searcher.doc_frequency("domain", term)
+        return counts
+
+    @staticmethod
+    def _build_topic_filter(topic: Optional[str]):
+        """Builds the Whoosh filter query for a topic slug.
+
+        An unknown slug yields NullQuery, which matches nothing. Silently
+        ignoring an unrecognised filter would report unfiltered results as if
+        they had been filtered, which is worse than returning none.
+        """
+        if topic is None:
+            return None
+        slug = str(topic).strip().lower()
+        if not slug:
+            return None
+        if slug not in TOPIC_LABELS:
+            return NullQuery
+        return Term("topics", slug)
 
     def close(self) -> None:
         """Closes any open index resources and triggers garbage collection for Windows."""
@@ -104,7 +153,9 @@ class SearchEngine:
             for fieldname in ("title", "content")
         )
 
-    def search(self, query_text: str, limit: int = 10) -> List[SearchResult]:
+    def search(
+        self, query_text: str, limit: int = 10, topic: Optional[str] = None
+    ) -> List[SearchResult]:
         """
         Executes a ranked full-text search across titles and page contents.
 
@@ -114,6 +165,9 @@ class SearchEngine:
         - Produces clean text excerpts (snippets) for terminal display.
         - Returns actual relevance scores computed by the engine.
         - Gracefully handles malformed queries.
+        - ``topic`` restricts results to documents carrying that topic label.
+          The restriction is applied as a Whoosh filter, which excludes
+          non-matching documents without changing any document's BM25F score.
 
         Partial-match policy:
         - The query is disjunctive: a document may match any of its analyzed
@@ -174,7 +228,12 @@ class SearchEngine:
             ):
                 return []
 
-            hits = searcher.search(parsed_query, limit=limit, terms=True)
+            hits = searcher.search(
+                parsed_query,
+                limit=limit,
+                terms=True,
+                filter=self._build_topic_filter(topic),
+            )
             results: List[SearchResult] = []
             minimum_matches = (len(query_terms) + 1) // 2
 
@@ -190,6 +249,11 @@ class SearchEngine:
                 domain = hit.get("domain", "")
                 title = hit.get("title", "Untitled")
                 score = float(hit.score)
+                topics: Tuple[str, ...] = tuple(
+                    slug
+                    for slug in str(hit.get("topics", "")).split(",")
+                    if slug
+                )
 
                 # Generate a highlighted snippet, then strip markup for terminal use
                 snippet = hit.highlights("content")
@@ -208,6 +272,7 @@ class SearchEngine:
                         snippet=snippet,
                         score=score,
                         domain=domain,
+                        topics=topics,
                     )
                 )
 
@@ -217,11 +282,14 @@ class SearchEngine:
 
 
 def search(
-    query: str, limit: int = 10, index_dir: Optional[Union[str, Path]] = None
+    query: str,
+    limit: int = 10,
+    index_dir: Optional[Union[str, Path]] = None,
+    topic: Optional[str] = None,
 ) -> List[SearchResult]:
     """
     Convenience function to search the mechatronics index.
     Opens, searches, and safely closes index resources in a single call.
     """
     with SearchEngine(index_dir=index_dir) as engine:
-        return engine.search(query_text=query, limit=limit)
+        return engine.search(query_text=query, limit=limit, topic=topic)
